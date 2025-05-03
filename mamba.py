@@ -2,6 +2,10 @@
 # Required Libraries:
 # pip install torch transformers accelerate bitsandbytes einops causal-conv1d mamba-ssm packaging datasets sentencepiece
 
+# coding=utf-8
+# Required Libraries:
+# pip install torch transformers accelerate bitsandbytes einops causal-conv1d mamba-ssm packaging datasets sentencepiece
+
 import math
 import torch
 import torch.nn as nn
@@ -265,70 +269,105 @@ class EarlyExitMambaKD(MambaPreTrainedModel, GenerationMixin):
 
 # === 3. Initialization Function (Handles shape mismatches heuristically) ===
 @torch.no_grad()
-@torch.no_grad()
 def initialize_student_from_teacher(student_model: EarlyExitMambaKD, teacher_model_path: str):
-    """Initializes student Mamba parameters from teacher Transformer using attention-to-Mamba mapping theory."""
-    logger.info(f"Initializing student from {teacher_model_path} using Attention-to-Mamba mapping...")
+    """
+    Initializes student Mamba parameters from teacher Llama, STRICTLY assuming
+    student dimensions are <= teacher dimensions for mapped parameters.
+    Uses slicing to extract relevant portions of teacher weights.
+    Focuses on V->in_proj. K->B and Q->C mappings are skipped due to
+    fundamental input dimension mismatch (d_model vs d_intermediate) in standard architectures.
+    """
+    logger.info(f"--- Starting STRICT Slicing Attention-to-Mamba Initialization ---")
+    logger.info(f"Initializing student '{type(student_model).__name__}' from teacher '{teacher_model_path}'")
 
     try:
-        teacher = AutoModelForCausalLM.from_pretrained(teacher_model_path, trust_remote_code=True).eval()
-        teacher_hidden_size = teacher.config.hidden_size
-        student_hidden_size = student_model.config.hidden_size
+        logger.info(f"Loading teacher model {teacher_model_path}...")
+        teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model_path, trust_remote_code=True)
+        teacher_model.eval()
+        teacher_config = teacher_model.config
+        student_config = student_model.config
+        logger.info("Teacher model loaded.")
 
-        # Verify dimension compatibility
-        if teacher_hidden_size != student_hidden_size:
-            raise ValueError(f"Teacher hidden size {teacher_hidden_size} != student {student_hidden_size}")
+        # --- Get Key Dimensions & Perform Sanity Checks ---
+        student_hidden_size = student_config.hidden_size
+        teacher_hidden_size = teacher_config.hidden_size
+        student_intermediate_size = student_config.intermediate_size
+        teacher_intermediate_size = teacher_config.intermediate_size
+        student_state_size = student_config.state_size # N
+        student_dt_rank = student_config.time_step_rank if student_config.time_step_rank != 'auto' else student_hidden_size // 16
 
-        # Layer mapping
-        num_teacher_layers = teacher.config.num_hidden_layers
-        num_student_layers = student_model.config.num_hidden_layers
-        layer_ratio = num_teacher_layers // num_student_layers
+        if student_hidden_size != teacher_hidden_size:
+             logger.error(f"Teacher ({teacher_hidden_size}) and Student ({student_hidden_size}) hidden sizes MUST match. Aborting init.")
+             return
+        if student_intermediate_size > teacher_intermediate_size:
+             logger.error(f"Student intermediate size ({student_intermediate_size}) > Teacher ({teacher_intermediate_size}). Cannot initialize via slicing. Aborting init.")
+             return
+        # It's okay if student_state_size is smaller than teacher head dims, we'll slice.
 
-        for student_idx, student_layer in enumerate(student_model.layers):
-            # Get corresponding teacher layer
-            teacher_idx = student_idx * layer_ratio
-            teacher_layer = teacher.model.layers[teacher_idx]
-            mamba_mixer = student_layer.mixer
+        num_teacher_layers = teacher_config.num_hidden_layers
+        num_student_layers = student_config.num_hidden_layers
+        logger.info(f"Mapping weights from up to {num_teacher_layers} teacher layers to {num_student_layers} student layers.")
+        num_layers_to_map = min(num_teacher_layers, num_student_layers)
+        mapped_layers_count = 0
 
-            # Get SSM parameters
-            d_model = student_model.config.hidden_size
-            expand = mamba_mixer.d_inner // d_model  # Expansion factor
-            d_state = mamba_mixer.d_state
+        for i in range(num_layers_to_map):
+            logger.debug(f"Mapping layer {i}...")
+            try:
+                teacher_layer = teacher_model.model.layers[i]
+                teacher_attn = teacher_layer.self_attn
+                # --- Get Teacher Weights ---
+                # These have shape (output_dim, input_dim=hidden_size)
+                W_q_teacher = teacher_attn.q_proj.weight.data
+                W_k_teacher = teacher_attn.k_proj.weight.data
+                W_v_teacher = teacher_attn.v_proj.weight.data
+                # Get dimensions
+                teacher_v_out_dim = W_v_teacher.shape[0]
+                teacher_k_out_dim = W_k_teacher.shape[0]
+                teacher_q_out_dim = W_q_teacher.shape[0]
 
-            # 1. Initialize in_proj (V mapping)
-            with torch.no_grad():
-                # Teacher projections
-                W_v = teacher_layer.self_attn.v_proj.weight  # (d_model, d_model)
+                student_mamba_mixer = student_model.layers[i].mixer
 
-                # Student in_proj (first half for x)
-                in_proj_weight = mamba_mixer.in_proj.weight
-                d_inner = mamba_mixer.d_inner
-                x_proj_weight = in_proj_weight[:d_inner]  # (d_inner, d_model)
+                # --- 1. Map V -> x (Initialize first half of in_proj) ---
+                # Target shape: (intermediate_size, hidden_size)
+                # Source shape: (v_dim, hidden_size)
+                in_proj_weight = student_mamba_mixer.in_proj.weight.data
+                target_v_part = in_proj_weight[:student_intermediate_size, :]
 
-                # Tile teacher's V projections to match expanded dimension
-                x_proj_weight.copy_(W_v.repeat(expand, 1))
+                # Calculate rows/cols to copy (must be <= target shape)
+                rows_to_copy_V = min(target_v_part.shape[0], teacher_v_out_dim)
+                cols_to_copy_V = target_v_part.shape[1] # Input hidden_size must match
 
-                # 2. Initialize B from K and C from Q (x_proj mapping)
-                W_k = teacher_layer.self_attn.k_proj.weight[:d_state]  # (d_state, d_model)
-                W_q = teacher_layer.self_attn.q_proj.weight[:d_state]  # (d_state, d_model)
+                # Copy the slice from teacher V
+                target_v_part[:rows_to_copy_V, :cols_to_copy_V].copy_(W_v_teacher[:rows_to_copy_V, :cols_to_copy_V])
+                logger.debug(f"  Layer {i}: Sliced Teacher V ({rows_to_copy_V}x{cols_to_copy_V}) into student in_proj (first half).")
+                # Zero out any remaining rows in the student's target slice if student intermediate > teacher V dim
+                if target_v_part.shape[0] > rows_to_copy_V:
+                    target_v_part[rows_to_copy_V:, :].zero_()
+                    logger.debug(f"  Layer {i}: Zeroed remaining rows in in_proj V part.")
 
-                # Get x_proj weights and split into delta/B/C
-                x_proj = mamba_mixer.x_proj.weight
-                d_conv = mamba_mixer.d_conv
-                B_slice = slice(d_conv, d_conv+d_state)
-                C_slice = slice(d_conv+d_state, d_conv+2*d_state)
 
-                # Expand K/Q projections to match student dimension
-                x_proj[B_slice] = W_k.repeat(1, expand)  # (d_state, d_inner)
-                x_proj[C_slice] = W_q.repeat(1, expand)
+                # --- 2. Map K -> B & Q -> C (Skipped due to Input Dimension Mismatch) ---
+                # The fundamental issue remains: x_proj input dim (intermediate_size) != teacher K/Q input dim (hidden_size).
+                # Therefore, a direct weight transfer (even slicing) for these specific projections is not architecturally sound
+                # without an intermediate projection layer or a modified Mamba architecture.
+                logger.warning(f"  Layer {i}: Skipping K->B and Q->C initialization. Input dimensions mismatch (Teacher: {teacher_hidden_size}, Student x_proj input: {student_intermediate_size}). Relying on default init for these x_proj parts.")
 
-            logger.info(f"Mapped teacher layer {teacher_idx} to student layer {student_idx}")
+                mapped_layers_count += 1
 
-        logger.info("Successfully initialized student with teacher projections!")
+            except AttributeError as e:
+                logger.error(f"  Layer {i}: Attribute error during mapping. Check Llama structure access. Error: {e}")
+            except Exception as e:
+                logger.error(f"  Layer {i}: Unexpected error during mapping: {e}")
 
+        logger.info(f"--- Finished STRICT Slicing Initialization ({mapped_layers_count}/{num_layers_to_map} layers processed for V->x) ---")
+        logger.info("--- K->B and Q->C mappings were skipped due to architectural input dimension mismatch. ---")
+
+    except FileNotFoundError:
+         logger.error(f"Teacher model path not found: {teacher_model_path}. Cannot initialize.")
+         raise
     except Exception as e:
-        logger.error(f"Initialization failed: {e}")
-        logger.warning("Proceeding with default initialization")
+        logger.error(f"Failed to load teacher model or perform initialization: {e}")
+        logger.error("Proceeding with student's default random initialization.")
 
 # === 5. Loss Function (Combined) ===
 # (Same as previous correct version)
@@ -471,7 +510,7 @@ def inference_with_early_exit(model, input_ids, threshold, device):
 if __name__ == "__main__":
     # --- Configuration ---
     # Match TinyLlama 1.1B config as much as possible for Mamba
-    teacher_model_name = "EleutherAI/pythia-70m"
+    teacher_model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     logger.info("Loading teacher config to align student config...")
     teacher_config = AutoConfig.from_pretrained(teacher_model_name, trust_remote_code=True)
 
@@ -482,8 +521,7 @@ if __name__ == "__main__":
         'ssm_cfg': {'d_state': 16, 'd_conv': 4, 'expand': 2}, # Mamba specific - KEEP THESE SMALL FOR COLAB
         'rms_norm': True, 'residual_in_fp32': True, 'fused_add_norm': True,
         'pad_vocab_size_multiple': 8, 'use_bias': False,
-        'layer_norm_epsilon': getattr(teacher_config, "rms_norm_eps", 
-                                  getattr(teacher_config, "layer_norm_eps", 1e-5)),
+        'layer_norm_epsilon': "rms_norm_eps",
         'hidden_act': teacher_config.hidden_act,
         'initializer_range': teacher_config.initializer_range,
         'intermediate_size': teacher_config.intermediate_size, # Match intermediate size
